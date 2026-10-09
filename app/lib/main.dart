@@ -1574,10 +1574,34 @@ class ScanPullResultsPage extends StatelessWidget {
   }
 }
 
+/// How the camera page captures: by tapping the box (default), or as soon as a
+/// barcode is centered. Remembered between sessions.
+class CameraModeStore {
+  static Future<File> _file() async => File('${(await getApplicationDocumentsDirectory()).path}/camera_mode.txt');
+
+  static Future<bool> loadAuto() async {
+    try {
+      final f = await _file();
+      return await f.exists() && (await f.readAsString()).trim() == 'auto';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> saveAuto(bool auto) async {
+    try {
+      await (await _file()).writeAsString(auto ? 'auto' : 'tap');
+    } catch (_) {}
+  }
+}
+
 /// Camera scanning with a crosshair. Only a barcode that sits entirely inside
-/// the scan box is captured, and only when it's the only one in the box — so a
-/// sheet of tags isn't swept up at once. After each capture the camera pauses
-/// briefly so the user can move to the next tag.
+/// the scan box counts, and only when it's the only one in the box — so a
+/// sheet of tags isn't swept up at once.
+///
+/// Tap mode (default): the box turns blue while a barcode is lined up, and
+/// tapping the preview adds it. Auto mode: it's added as soon as it's lined
+/// up, then the camera pauses briefly so the user can move to the next tag.
 class CameraScanPage extends StatefulWidget {
   const CameraScanPage({super.key, required this.onBarcode, required this.inList, required this.count});
 
@@ -1593,7 +1617,13 @@ class CameraScanPage extends StatefulWidget {
 class _CameraScanPageState extends State<CameraScanPage> {
   static const _pause = Duration(milliseconds: 1000);
 
+  /// How long a barcode stays "lined up" after the camera last saw it — covers
+  /// the gap between frames and the hand shake of the tap itself.
+  static const _readyFor = Duration(milliseconds: 700);
+
   final _controller = MobileScannerController(detectionSpeed: DetectionSpeed.normal);
+
+  bool _auto = false;
 
   DateTime _pausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -1607,9 +1637,23 @@ class _CameraScanPageState extends State<CameraScanPage> {
   String? _flagged;
   Timer? _reset;
 
+  /// Tap mode: the new barcode currently lined up in the box, and when it was
+  /// last seen.
+  String? _ready;
+  DateTime _readyAt = DateTime.fromMillisecondsSinceEpoch(0);
+
   String? _last;
-  String _message = 'Center one barcode in the box';
+  String _message = '';
   Color _boxColor = Colors.white;
+
+  @override
+  void initState() {
+    super.initState();
+    _message = _idleMessage;
+    CameraModeStore.loadAuto().then((auto) {
+      if (mounted && auto != _auto) _setAuto(auto, save: false);
+    });
+  }
 
   @override
   void dispose() {
@@ -1617,6 +1661,18 @@ class _CameraScanPageState extends State<CameraScanPage> {
     _forgetJustAdded?.cancel();
     _controller.dispose();
     super.dispose();
+  }
+
+  String get _idleMessage => _auto ? 'Center one barcode in the box' : 'Line up one barcode, then tap the box';
+
+  void _setAuto(bool auto, {bool save = true}) {
+    if (save) CameraModeStore.saveAuto(auto);
+    setState(() {
+      _auto = auto;
+      _ready = null;
+      _boxColor = Colors.white;
+      _message = _idleMessage;
+    });
   }
 
   /// Returns the box to white once nothing has been detected for [after].
@@ -1627,6 +1683,8 @@ class _CameraScanPageState extends State<CameraScanPage> {
       setState(() {
         _boxColor = Colors.white;
         _flagged = null;
+        if (_ready != null) _message = _idleMessage;
+        _ready = null;
       });
     });
   }
@@ -1643,7 +1701,11 @@ class _CameraScanPageState extends State<CameraScanPage> {
 
     final values = capture.barcodes.map((b) => b.rawValue).whereType<String>().where((v) => v.isNotEmpty).toSet();
     if (values.length > 1) {
-      setState(() => _message = 'More than one barcode in the box — center just one');
+      setState(() {
+        _ready = null;
+        _boxColor = Colors.white;
+        _message = 'More than one barcode in the box — center just one';
+      });
       return;
     }
     if (values.isEmpty) return;
@@ -1662,17 +1724,49 @@ class _CameraScanPageState extends State<CameraScanPage> {
         HapticFeedback.heavyImpact();
       }
       setState(() {
+        _ready = null;
         _message = '$value is already in the list';
         _boxColor = statusDanger;
       });
       _resetBoxAfter(const Duration(milliseconds: 700));
       return;
     }
+    _flagged = null;
 
+    if (_auto) {
+      _capture(value);
+      return;
+    }
+
+    // Tap mode: hold it as ready until it leaves the box.
+    if (_ready != value) HapticFeedback.selectionClick();
+    _readyAt = DateTime.now();
+    setState(() {
+      _ready = value;
+      _message = 'Tap to add $value';
+      _boxColor = brijjBlue;
+    });
+    _resetBoxAfter(_readyFor);
+  }
+
+  void _onTap() {
+    if (_auto) return;
+    final value = _ready;
+    if (value == null || DateTime.now().difference(_readyAt) > _readyFor) {
+      HapticFeedback.heavyImpact();
+      setState(() => _message = _boxColor == statusDanger
+          ? _message
+          : 'No barcode lined up — center one in the box and tap again');
+      return;
+    }
+    _capture(value);
+  }
+
+  void _capture(String value) {
     widget.onBarcode(value);
+    _ready = null;
     _justAdded = value;
     _forgetJustAddedAfter(_pause + const Duration(milliseconds: 700));
-    _flagged = null;
     _pausedUntil = DateTime.now().add(_pause);
     setState(() {
       _last = value;
@@ -1688,6 +1782,11 @@ class _CameraScanPageState extends State<CameraScanPage> {
       appBar: AppBar(
         title: Text('Camera scan (${widget.count()})'),
         actions: [
+          IconButton(
+            tooltip: _auto ? 'Auto capture on — switch to tap to capture' : 'Tap to capture — switch to auto capture',
+            icon: Icon(_auto ? Icons.flash_auto : Icons.touch_app),
+            onPressed: () => _setAuto(!_auto),
+          ),
           IconButton(tooltip: 'Torch', icon: const Icon(Icons.flashlight_on), onPressed: _controller.toggleTorch),
         ],
       ),
@@ -1714,6 +1813,28 @@ class _CameraScanPageState extends State<CameraScanPage> {
                 rect: scanWindow,
                 child: IgnorePointer(child: CustomPaint(painter: _CrosshairPainter(_boxColor))),
               ),
+              if (!_auto)
+                Positioned(
+                  left: scanWindow.left,
+                  width: scanWindow.width,
+                  top: scanWindow.bottom + 12,
+                  child: IgnorePointer(
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.touch_app, color: _ready != null ? brijjBlue : Colors.white, size: 20),
+                        const SizedBox(width: 6),
+                        Text(
+                          _ready != null ? 'Tap to add' : 'Tap the box to capture',
+                          style: const TextStyle(color: Colors.white, fontSize: 15, shadows: [Shadow(blurRadius: 4)]),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              // Tap anywhere on the preview — the box itself is a small target
+              // when holding a terminal one-handed.
+              if (!_auto) Positioned.fill(child: GestureDetector(behavior: HitTestBehavior.opaque, onTap: _onTap)),
               Align(
                 alignment: Alignment.bottomCenter,
                 child: Container(

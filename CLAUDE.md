@@ -174,6 +174,11 @@ Scan Pull — collect barcodes on the floor, then load them into the system.
   finishing after sign-out is dropped); initials on Brijj blue when there's no picture or it can't
   be decoded. Endpoint confirmed on prod (401, not 404) but **not yet tested with a real user that
   has a picture** — staging was down; the URL's host/auth (public vs signed) is unknown.
+- v1.20.0 (2026-10-09): **tap to capture** on the camera page (default). The box turns Brijj blue
+  while one new barcode is lined up ("Tap to add …", light tick); tapping anywhere on the preview adds
+  it (must have been seen in the last 0.7 s, else "No barcode lined up"). Duplicates still turn the
+  box red. App-bar button switches to the old **auto capture**; choice saved in `camera_mode.txt`.
+  Awaiting device test.
 - Open: smaller per-ABI APK once the terminal
   model is known.
 - Builds go to `release/` **and** the self-update feed: after `flutter build apk --release` run
