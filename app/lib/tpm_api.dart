@@ -489,6 +489,75 @@ class TpmApi {
     ].length;
   }
 
+  // ── License plates, Quick Transfer, Quick Receive ──────────────────────────
+
+  Future<List<Map<String, dynamic>>> _list(BrijjSession session, String path, Map<String, String> query) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi$path').replace(queryParameters: query), null, session.accessToken);
+    final list = body is Map ? body['items'] : body;
+    return [
+      for (final x in list as List? ?? const [])
+        if (x is Map) x.cast<String, dynamic>(),
+    ];
+  }
+
+  /// [warehouseId]'s license plates (with items and serials), newest first.
+  Future<List<Map<String, dynamic>>> licensePlates(BrijjSession session, int warehouseId) async =>
+      (await _list(session, '/api/LicensePlates', {'CompanyId': session.companyId, 'WarehouseId': '$warehouseId', 'PageSize': '500'}))
+        ..sort((a, b) => '${b['createdAt']}'.compareTo('${a['createdAt']}'));
+
+  /// The license plate holding a product serial, if any.
+  Future<Map<String, dynamic>?> licensePlateForSerial(BrijjSession session, int productSerialId) async =>
+      (await _list(session, '/api/LicensePlates', {'CompanyId': session.companyId, 'ProductSerialId': '$productSerialId'})).firstOrNull;
+
+  /// IMS's check before a serial joins a transfer (ValidateInventoryUsage, as the
+  /// Quick Transfer screen calls it): (isValid, message).
+  Future<(bool, String)> validateSerialUsage(BrijjSession session, int productSerialId, int warehouseId) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/ValidateInventoryUsages/ValidateInventoryUsage').replace(
+      queryParameters: {
+        'ItemType': '3', // ProductSerial
+        'ProductSerialId': '$productSerialId',
+        'CompanyId': session.companyId,
+        'WarehouseId': '$warehouseId',
+        'CheckExistingLpSerial': 'false',
+      },
+    );
+    final body = await _send('GET', uri, null, session.accessToken);
+    return (body is Map && body['isValid'] == true, '${body is Map ? body['message'] ?? '' : ''}');
+  }
+
+  /// Creates a transfer order (Quick Transfer sends transferOrderProcessType 2).
+  Future<Map<String, dynamic>> createTransferOrder(BrijjSession session, Map<String, dynamic> order) async {
+    await _ensureFresh(session);
+    final body = await _send('POST', Uri.parse('$imsApi/api/TransferOrders'), order, session.accessToken);
+    return body is Map ? body.cast<String, dynamic>() : const {};
+  }
+
+  /// Transfers waiting to be received in [warehouseId] (IMS "Ready for receive":
+  /// Transfer Receive work items that are still Pending).
+  Future<List<Map<String, dynamic>>> readyToReceive(BrijjSession session, int warehouseId) =>
+      _list(session, '/api/Worklists', {
+        'CompanyId': session.companyId,
+        'Type': '6', // TransferReceiveOrder
+        'Status': '1', // Pending
+        'WarehouseId': '$warehouseId',
+        'PageSize': '100',
+      });
+
+  Future<Map<String, dynamic>> transferDispatchOrder(BrijjSession session, int id) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi/api/TransferDispatchOrders/$id'), null, session.accessToken);
+    return (body as Map).cast<String, dynamic>();
+  }
+
+  /// Receives a transfer (Quick Receive posts processType 2, status Received 8).
+  Future<Map<String, dynamic>> createTransferReceiveOrder(BrijjSession session, Map<String, dynamic> order) async {
+    await _ensureFresh(session);
+    final body = await _send('POST', Uri.parse('$imsApi/api/TransferReceiveOrders'), order, session.accessToken);
+    return body is Map ? body.cast<String, dynamic>() : const {};
+  }
+
   // ── Inventory Count (mirrors the IMS web app's counting work item) ─────────
 
   /// The company's warehouses, by id, from its locations (for picking where to count).
@@ -869,6 +938,7 @@ class ImsSerial {
     required this.locationId,
     required this.locationName,
     required this.warehouseId,
+    this.productName = '',
   });
 
   final int serialId;
@@ -877,12 +947,16 @@ class ImsSerial {
   final String locationName;
   final int warehouseId;
 
+  /// e.g. "Girl's/Accessories/NA/…" (IMS product name), when known.
+  final String productName;
+
   static ImsSerial fromJson(Map<String, dynamic> j, int warehouseId) => ImsSerial(
     serialId: (j['id'] as num).toInt(),
     productId: (j['productId'] as num).toInt(),
     locationId: (j['warehouseLocationId'] as num).toInt(),
     locationName: '${(j['warehouseLocation'] as Map?)?['name'] ?? j['warehouseLocationId']}',
     warehouseId: warehouseId,
+    productName: '${(j['product'] as Map?)?['name'] ?? j['productName'] ?? ''}',
   );
 
   Map<String, dynamic> toJson() => {
@@ -891,6 +965,7 @@ class ImsSerial {
     'warehouseLocationId': locationId,
     'warehouseLocation': {'name': locationName},
     'warehouseId': warehouseId,
+    'productName': productName,
   };
 }
 

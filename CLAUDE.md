@@ -264,6 +264,30 @@ Scan Pull — collect barcodes on the floor, then load them into the system.
     first), Memphis work = 1 transfer pick + 2 transfer receives (→ IMS pages), 3 counts to approve,
     location scan "Sales Floor" → 856, unknown label → 404. **Start/finish of a Relocation, count
     submit, and the in-app IMS page are not yet run end to end.** 25 tests pass.
+- v2.1.0 (2026-10-09, `ims-mobile`): **Quick Transfer, Quick Receive, License Plates** (drawer +
+  dashboard), mirrored from the IMS web app (`864.js` quick-transfer-order-wrapper, `997.js`
+  quick-transfer-receive). Request builders in `lib/transfer_model.dart` (tested):
+  - Quick Transfer: `POST /api/TransferOrders` {fromWarehouseId, toWarehouseId, transferScope (1 LP /
+    2 Product), status 1 Open, date/expectedDeliveryDate yyyy-mm-dd, priority, notes, type 1
+    StockTransfer, companyId, transferOrderProcessType 2 Quick, items: product {productId, quantity,
+    status 4, serials [{productSerialId}]} or plate {licensePlateId}}. Each scanned serial is checked
+    first with `GET ValidateInventoryUsages/ValidateInventoryUsage?ItemType=3&ProductSerialId&CompanyId
+    &WarehouseId&CheckExistingLpSerial=false` (e.g. "already packed inside License Plate" → refused).
+    Limit 1000 product units (IMS offers regular transfer above that).
+  - Quick Receive: list = `GET /api/Worklists?Type=6&Status=1 (Pending)&WarehouseId` (IMS "Ready for
+    receive"); dispatch = `GET /api/TransferDispatchOrders/{line.referenceId}`; `POST
+    /api/TransferReceiveOrders` {transferDispatchOrderId, transferOrderId, processType 2,
+    receivedDate, companyId, status 8 Received, receivedByUserId, items [{transferDispatchOrderItemId,
+    transferOrderItemId, productId, licensePlateAction 0, licensePlateId, quantityReceived =
+    quantityDispatched, destinationLocationId, serials [{productId, warehouseId, productSerialId,
+    serialNumber}]}]}. Product lines need every dispatched serial scanned (IMS rule); plates are
+    received whole (plate lines dispatch with quantity 0 — sent as-is, like the web app).
+  - License Plates: `GET /api/LicensePlates?CompanyId&WarehouseId` (items + itemSerials included),
+    scan a plate ref or any item (→ `LicensePlates?ProductSerialId`) to open it. Status 1 In use 2
+    Relocating 3 Available 4 Transfer pending 5 In transit.
+  Verified read-only on staging: plates list, plate-for-serial, serial validation messages, receive
+  bodies built from TDO-99-260810-0001 / -260817-0001. **No transfer or receive was posted.**
+  `ImsSerial.productName` added. 29 tests pass.
 - Open: smaller per-ABI APK once the terminal
   model is known.
 - Builds go to `release/` **and** the self-update feed: after `flutter build apk --release` run
@@ -285,6 +309,8 @@ Git: `git@github.com:Rubes78/Inventory.git` (branch `main`, **public**). Never c
 | `app/lib/relocation_task.dart` | Relocation work task (native) — `relocation_model.dart` holds the rules |
 | `app/lib/quick_relocation.dart` | Quick Relocation (native) |
 | `app/lib/ims_web.dart` | Signed-in in-app IMS web page for other task types |
+| `app/lib/transfers.dart` | Quick Transfer, Quick Receive (list + receive) — `transfer_model.dart` builds the requests |
+| `app/lib/license_plates.dart` | License plate list, scan-to-find, detail |
 | `app/lib/scan_input.dart` | Shared scan field for every screen |
 | `app/lib/count_model.dart` | Inventory Count lines/scans/payload, mirroring the IMS web counting screen |
 | `app/lib/inventory_count.dart` | Inventory Count screens: open count work items, scan-to-count, submit |

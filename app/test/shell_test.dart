@@ -18,10 +18,16 @@ void main() {
     expect(find.text('Dashboard'), findsWidgets);
     await tester.tap(find.byTooltip('Open navigation menu'));
     await tester.pumpAndSettle();
-    for (final label in ['Work', 'Quick Relocation', 'Scan Pull', 'History', 'Logout']) {
-      expect(find.text(label), findsWidgets, reason: label);
-    }
     expect(find.text('Test User'), findsOneWidget);
     expect(find.textContaining('Warehouse:', findRichText: true), findsOneWidget);
+    for (final label in ['Work', 'Quick Relocation', 'Quick Transfer', 'Quick Receive', 'License Plates', 'Scan Pull', 'History', 'Logout']) {
+      final inDrawer = find.descendant(of: find.byType(Drawer), matching: find.text(label));
+      await tester.scrollUntilVisible(
+        inDrawer,
+        60,
+        scrollable: find.descendant(of: find.byType(Drawer), matching: find.byType(Scrollable)).first,
+      );
+      expect(inDrawer, findsOneWidget, reason: label);
+    }
   });
 }

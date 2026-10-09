@@ -8,11 +8,13 @@ import 'brand.dart';
 import 'history.dart';
 import 'ims_web.dart';
 import 'inventory_count.dart';
+import 'license_plates.dart';
 import 'main.dart' show LookupCache, ScanListPage, ScanStore;
 import 'pending_moves.dart';
 import 'quick_relocation.dart';
 import 'relocation_task.dart';
 import 'tpm_api.dart';
+import 'transfers.dart';
 import 'updater.dart';
 import 'user_photo.dart';
 import 'work_model.dart';
@@ -68,6 +70,7 @@ class _AppShellState extends State<AppShell> {
   List<WorkItem>? _work;
   WorkFilter _filter = WorkFilter.all;
   int _approvals = 0;
+  int _toReceive = 0;
   int _awaiting = 0;
   int _unsubmitted = 0;
   bool _loading = false;
@@ -115,12 +118,14 @@ class _AppShellState extends State<AppShell> {
     try {
       final work = flattenWork(await api.myWorklists(widget.session, wh.id));
       final approvals = await api.pendingApprovals(widget.session, wh.id);
+      final toReceive = (await api.readyToReceive(widget.session, wh.id)).length;
       if (_awaiting > 0) await PendingMoveStore.checkAll(api, widget.session);
       _awaiting = (await PendingMoveStore.load()).length;
       if (mounted) {
         setState(() {
           _work = work;
           _approvals = approvals;
+          _toReceive = toReceive;
         });
       }
     } on TpmApiException catch (e) {
@@ -188,6 +193,26 @@ class _AppShellState extends State<AppShell> {
     await cache.load();
     final wh = _warehouse;
     _push(HistoryPage(session: widget.session, warehouseId: wh?.id ?? cache.destination?.warehouseId, warehouseName: wh?.name));
+  }
+
+  void _openQuickTransfer() {
+    final wh = _warehouse;
+    if (wh == null) return;
+    if (_warehouses.length < 2) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Quick Transfer needs another active warehouse.')));
+      return;
+    }
+    _push(QuickTransferPage(session: widget.session, from: wh, warehouses: _warehouses));
+  }
+
+  void _openQuickReceive() {
+    final wh = _warehouse;
+    if (wh != null) _push(QuickReceiveListPage(session: widget.session, warehouse: wh));
+  }
+
+  void _openLicensePlates() {
+    final wh = _warehouse;
+    if (wh != null) _push(LicensePlatesPage(session: widget.session, warehouse: wh));
   }
 
   void _openAwaiting() => _push(PendingMovesPage(session: widget.session, onReAdd: ScanStore.appendSaved));
@@ -282,6 +307,9 @@ class _AppShellState extends State<AppShell> {
               setState(() => _section = _Section.work);
             }, active: _section == _Section.work),
             item(Icons.move_down, 'Quick Relocation', _openQuickRelocation),
+            item(Icons.local_shipping, 'Quick Transfer', _openQuickTransfer),
+            item(Icons.move_to_inbox, 'Quick Receive', _openQuickReceive),
+            item(Icons.pallet, 'License Plates', _openLicensePlates),
             item(Icons.remove_shopping_cart, 'Scan Pull', _openScanPull),
             item(Icons.history, 'History', _openHistory),
             const Divider(),
@@ -376,6 +404,12 @@ class _AppShellState extends State<AppShell> {
             ),
           ],
         ),
+        Row(
+          children: [
+            _stat('Ready to receive', n(_toReceive), Icons.move_to_inbox, onTap: _openQuickReceive),
+            _stat('License plates', '›', Icons.pallet, onTap: _openLicensePlates),
+          ],
+        ),
         if (ongoing != null)
           Card(
             color: brijjBlueTint,
@@ -417,6 +451,8 @@ class _AppShellState extends State<AppShell> {
           children: [
             FilledButton.icon(onPressed: _openScanPull, icon: const Icon(Icons.remove_shopping_cart), label: const Text('Scan Pull')),
             FilledButton.tonalIcon(onPressed: _openQuickRelocation, icon: const Icon(Icons.move_down), label: const Text('Quick Relocation')),
+            FilledButton.tonalIcon(onPressed: _openQuickTransfer, icon: const Icon(Icons.local_shipping), label: const Text('Quick Transfer')),
+            FilledButton.tonalIcon(onPressed: _openQuickReceive, icon: const Icon(Icons.move_to_inbox), label: const Text('Quick Receive')),
             OutlinedButton.icon(onPressed: () => showWork(WorkFilter.all), icon: const Icon(Icons.show_chart), label: const Text('Work')),
             OutlinedButton.icon(onPressed: _openHistory, icon: const Icon(Icons.history), label: const Text('History')),
           ],
