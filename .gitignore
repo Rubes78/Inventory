@@ -1,0 +1,11 @@
+# Secrets
+.env
+*.keystore
+*.jks
+key.properties
+
+# Build output — APKs are published via publish.sh, not git
+release/
+*.apk
+scan_pull_result_*.csv
+__pycache__/
