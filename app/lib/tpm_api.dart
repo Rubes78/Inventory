@@ -17,6 +17,9 @@ enum BrijjEnv {
   String get tpmApi => 'https://productionsystem-api.$domain';
   String get imsApi => 'https://inventory-api.$domain';
 
+  /// The IMS web app (opened in-app for work the app doesn't do natively).
+  String get imsWeb => 'https://inventory.$domain';
+
   static BrijjEnv byName(String? name) => values.firstWhere((e) => e.name == name, orElse: () => staging);
 }
 
@@ -125,6 +128,12 @@ class TpmApi {
     } catch (_) {
       return null;
     }
+  }
+
+  /// The session's access token, refreshed first if it's about to expire.
+  Future<String> freshToken(BrijjSession session) async {
+    await _ensureFresh(session);
+    return session.accessToken;
   }
 
   /// A fresh access token when the current one is within 2 minutes of expiry.
@@ -368,6 +377,116 @@ class TpmApi {
     await _ensureFresh(session);
     final body = await _send('GET', Uri.parse('$imsApi/api/MovementOrders/$orderId'), null, session.accessToken);
     return MovementOrderDetail.fromJson((body as Map).cast<String, dynamic>());
+  }
+
+  // ── IMS mobile view: warehouse context and work items ─────────────────────
+
+  /// The company's active warehouses (IMS: Warehouses?Status=Active), as the IMS
+  /// mobile view's warehouse switcher lists them.
+  Future<List<Warehouse>> activeWarehouses(BrijjSession session) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/Warehouses').replace(queryParameters: {'CompanyId': session.companyId, 'Status': '2'});
+    final body = await _send('GET', uri, null, session.accessToken);
+    final list = body is Map ? body['items'] : body;
+    return [
+      for (final w in list as List? ?? const [])
+        if (w is Map && w['id'] is num) Warehouse((w['id'] as num).toInt(), '${w['name'] ?? w['id']}'),
+    ]..sort((a, b) => a.name.compareTo(b.name));
+  }
+
+  /// The user's IMS default warehouse (company user record), falling back to their
+  /// general default warehouse; null if neither is set.
+  Future<int?> defaultWarehouseId(BrijjSession session) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$companyApi/api/Users/${session.userId}/Lite'), null, session.accessToken);
+    if (body is! Map) return null;
+    return ((body['imsDefaultWarehouseId'] ?? body['defaultWarehouseId']) as num?)?.toInt();
+  }
+
+  /// The user's work in [warehouseId], as the IMS Work screen loads it
+  /// (Users/{id}/Worklists): every worklist with its task lines.
+  Future<List<Map<String, dynamic>>> myWorklists(BrijjSession session, int warehouseId) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/Users/${session.userId}/Worklists').replace(
+      queryParameters: {'CompanyId': session.companyId, 'warehouseId': '$warehouseId', 'ClientSidePagination': 'true'},
+    );
+    final body = await _send('GET', uri, null, session.accessToken);
+    final list = body is Map ? body['items'] : body;
+    return [
+      for (final w in list as List? ?? const [])
+        if (w is Map) w.cast<String, dynamic>(),
+    ];
+  }
+
+  Future<void> updateWorklist(BrijjSession session, Map<String, dynamic> worklist) async {
+    await _ensureFresh(session);
+    await _send('PUT', Uri.parse('$imsApi/api/Worklists/${worklist['id']}'), worklist, session.accessToken);
+  }
+
+  /// Assigns a work item's task line to the signed-in user (IMS "Start …").
+  Future<void> assignTask(BrijjSession session, int taskLineId) async {
+    await _ensureFresh(session);
+    await _send('POST', Uri.parse('$imsApi/api/WorklistItems/$taskLineId/ChangeAssignment'), {
+      'userId': int.tryParse(session.userId) ?? session.userId,
+    }, session.accessToken);
+  }
+
+  /// A movement order as IMS returns it, for editing and saving back.
+  Future<Map<String, dynamic>> movementOrderRaw(BrijjSession session, int orderId) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi/api/MovementOrders/$orderId'), null, session.accessToken);
+    return (body as Map).cast<String, dynamic>();
+  }
+
+  /// Saves a movement order (lines' statuses and destinations included); returns
+  /// IMS's answer (its status may come back Queued).
+  Future<Map<String, dynamic>> updateMovementOrder(BrijjSession session, Map<String, dynamic> order) async {
+    await _ensureFresh(session);
+    final body = await _send('PUT', Uri.parse('$imsApi/api/MovementOrders/${order['id']}'), order, session.accessToken);
+    return body is Map ? body.cast<String, dynamic>() : const {};
+  }
+
+  Future<void> changeMovementOrderStatus(BrijjSession session, int orderId, int status) async {
+    await _ensureFresh(session);
+    await _send('PUT', Uri.parse('$imsApi/api/MovementOrders/$orderId/Status'), {'status': status}, session.accessToken);
+  }
+
+  /// Checks a scanned location label in [warehouseId] (IMS WarehouseLocations/Scan).
+  Future<Map<String, dynamic>> scanLocation(BrijjSession session, String label, int warehouseId) async {
+    await _ensureFresh(session);
+    final body = await _send('POST', Uri.parse('$imsApi/api/WarehouseLocations/Scan'), {
+      'name': label,
+      'warehouseId': warehouseId,
+      'companyId': int.tryParse(session.companyId) ?? session.companyId,
+    }, session.accessToken);
+    return (body as Map).cast<String, dynamic>();
+  }
+
+  /// [warehouseId]'s active locations, for choosing a destination.
+  Future<List<Map<String, dynamic>>> warehouseLocations(BrijjSession session, int warehouseId) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/WarehouseLocations/Lite').replace(
+      queryParameters: {'CompanyId': session.companyId, 'WarehouseId': '$warehouseId'},
+    );
+    final body = await _send('GET', uri, null, session.accessToken);
+    return [
+      for (final l in body as List? ?? const [])
+        if (l is Map) l.cast<String, dynamic>(),
+    ]..sort((a, b) => '${a['name']}'.compareTo('${b['name']}'));
+  }
+
+  /// Inventory counts in [warehouseId] with lines counted and waiting for approval.
+  Future<int> pendingApprovals(BrijjSession session, int warehouseId) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/InventoryCounts').replace(
+      queryParameters: {'CompanyId': session.companyId, 'WarehouseId': '$warehouseId', 'PageSize': '200'},
+    );
+    final body = await _send('GET', uri, null, session.accessToken);
+    final list = body is Map ? body['items'] : body;
+    return [
+      for (final c in list as List? ?? const [])
+        if (c is Map && (c['items'] as List? ?? const []).any((i) => i is Map && i['status'] == 2)) c,
+    ].length;
   }
 
   // ── Inventory Count (mirrors the IMS web app's counting work item) ─────────
@@ -773,6 +892,14 @@ class ImsSerial {
     'warehouseLocation': {'name': locationName},
     'warehouseId': warehouseId,
   };
+}
+
+/// An IMS warehouse.
+class Warehouse {
+  const Warehouse(this.id, this.name);
+
+  final int id;
+  final String name;
 }
 
 /// IMS movement order statuses (MovementOrderStatus, from the IMS web app).

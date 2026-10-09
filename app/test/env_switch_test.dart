@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:scan_pull/main.dart';
 import 'package:scan_pull/tpm_api.dart';
 
-import 'home_page_test.dart' show fakeSession;
+import 'shell_test.dart' show fakeSession;
 
 void main() {
   test('environments point at the right servers', () {

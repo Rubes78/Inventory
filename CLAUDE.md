@@ -232,6 +232,38 @@ Scan Pull — collect barcodes on the floor, then load them into the system.
   "Producer Bin", old "Scan Pull Memphis" are never listed so never counted); scans of items IMS has
   elsewhere say "not counted — IMS has it in <loc>". Verified read-only: IC-99-260629-0006 (only in
   Scrap) → 0 lines; IC-99-260629-0007 → Pants @ Sales Floor.
+- **v2.0.0 (2026-10-09, branch `ims-mobile`, dc-dsiemvandroid session): the app becomes the IMS
+  mobile view + instant Scan Pull.** User's direction: mirror the IMS web app's mobile view (drawer:
+  user card with Warehouse, Dashboard, Work, Quick Relocation, Logout — see `IMS -Mobile View.jpg`,
+  not committed) instead of the earlier home-tile design. Decisions: keep TPM fallback for Scan Pull;
+  task types not done natively open the IMS page in-app; native = Cycle Count/Recount + Relocation.
+  - `shell.dart` `AppShell` replaces HomePage: warehouse context = `WarehouseStore` (device) else user's
+    company `Users/{id}/Lite` imsDefaultWarehouseId (→ defaultWarehouseId → first) among
+    `Warehouses?Status=2`; Dashboard is real data (my/open/unassigned tasks, counts with Counted lines
+    = "to approve" → IMS `/counting/counting-approval`, Awaiting IMS, unsubmitted) — **the IMS web
+    mobile dashboard tiles are hard-coded placeholders**, only Pending Approvals is real there.
+  - Work = `Users/{me}/Worklists?CompanyId&warehouseId&ClientSidePagination=true`, flattened and
+    labelled exactly like IMS work-items (`work_model.dart`, tested). Handlers: count →
+    `CountPage`, relocate → `RelocationTaskPage`, else `ImsWebPage` at the IMS route (dispatch pick/
+    pack/ship → `/work-items`, since IMS hands those over in memory).
+  - `ims_web.dart`: WebView signed in by setting the IMS web app's `accessToken`/`refreshToken` cookies
+    on `inventory.<domain>` and `imsSelectedWarehouseId`/`imsSavePreference=false` in localStorage
+    (reload once). Detects a bounce to `/shared/login`. Not yet device-tested.
+  - `relocation_task.dart` + `relocation_model.dart` (tested): mirrors IMS app-process-relocation —
+    Start = worklist line 3 + userId (PUT worklist), MO → Work in progress unless Processing; lines
+    Pending 1 → Picked 2 (scan a line serial or tap) → destination (scan label via
+    `POST WarehouseLocations/Scan`, or choose from Lite; ≠ source) → Relocated 3; Finish = MO
+    Completed 5 / WIP 2 / Open 1 + worklist 3/2/1, lines 4/3/1, `PUT MovementOrders/{id}`,
+    `PUT Worklists/{id}`. No task-duration timers yet.
+  - `quick_relocation.dart`: destination (scan label/choose) + scanned items (ProductSerials in the
+    warehouse) + reason → `moveToLocation` (same quick MO as Scan Pull), pending tracked.
+  - Scan Pull now follows the selected warehouse (`ScanListPage.warehouseId` → `_whLocations`).
+  - `scan_input.dart`: shared scan field (keystroke + broadcast/clipboard channel, keyboard hidden).
+  - Removed: HomePage, the stand-alone count list, `test/home_page_test.dart` (→ `shell_test.dart`).
+  - Verified read-only on staging (automation99): warehouses Memphis/Processing (no IMS default →
+    first), Memphis work = 1 transfer pick + 2 transfer receives (→ IMS pages), 3 counts to approve,
+    location scan "Sales Floor" → 856, unknown label → 404. **Start/finish of a Relocation, count
+    submit, and the in-app IMS page are not yet run end to end.** 25 tests pass.
 - Open: smaller per-ABI APK once the terminal
   model is known.
 - Builds go to `release/` **and** the self-update feed: after `flutter build apk --release` run
@@ -248,6 +280,12 @@ Git: `git@github.com:Rubes78/Inventory.git` (branch `main`, **public**). Never c
 |---|---|
 | `release/ScanPull.apk` | Latest sideloadable build — copy the new APK here after every build |
 | `app/` | Flutter project (`com.brijjworks.scan_pull`, Android only) |
+| `app/lib/shell.dart` | App shell = IMS mobile view: drawer (user, warehouse), Dashboard, Work |
+| `app/lib/work_model.dart` | IMS work items: flatten/filter/labels, native vs IMS-page routing |
+| `app/lib/relocation_task.dart` | Relocation work task (native) — `relocation_model.dart` holds the rules |
+| `app/lib/quick_relocation.dart` | Quick Relocation (native) |
+| `app/lib/ims_web.dart` | Signed-in in-app IMS web page for other task types |
+| `app/lib/scan_input.dart` | Shared scan field for every screen |
 | `app/lib/count_model.dart` | Inventory Count lines/scans/payload, mirroring the IMS web counting screen |
 | `app/lib/inventory_count.dart` | Inventory Count screens: open count work items, scan-to-count, submit |
 | `app/lib/history.dart` | History: IMS movement orders (list/detail) + this device's submit log |

@@ -11,9 +11,9 @@ import 'package:share_plus/share_plus.dart';
 
 import 'brand.dart';
 import 'history.dart';
-import 'inventory_count.dart';
 import 'lookup.dart';
 import 'pending_moves.dart';
+import 'shell.dart';
 import 'tpm_api.dart';
 import 'updater.dart';
 import 'user_photo.dart';
@@ -146,221 +146,7 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
     if (!_loaded) return const Scaffold(body: Center(child: CircularProgressIndicator()));
     final session = _session;
     if (session == null) return LoginPage(onSignedIn: _signedIn);
-    return HomePage(key: ValueKey(session.sessionId), session: session, onSignedOut: _signedOut);
-  }
-}
-
-/// Start screen after sign-in: pick a task. Scan Pull is live; Transfers and
-/// Inventory Count are placeholders for upcoming work.
-class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.session, required this.onSignedOut});
-
-  final BrijjSession session;
-  final Future<void> Function() onSignedOut;
-
-  @override
-  State<HomePage> createState() => _HomePageState();
-}
-
-class _HomePageState extends State<HomePage> {
-  /// Unsubmitted Scan Pull barcodes saved on the device.
-  int _pending = 0;
-
-  /// Submitted pulls IMS hasn't confirmed yet.
-  int _awaiting = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    _refresh();
-  }
-
-  Future<void> _refresh() async {
-    final n = await ScanStore.savedCount();
-    final waiting = await PendingMoveStore.load();
-    if (mounted) {
-      setState(() {
-        _pending = n;
-        _awaiting = waiting.length;
-      });
-    }
-    if (waiting.isNotEmpty) _checkAwaiting();
-  }
-
-  /// Quietly asks IMS about pulls it hadn't finished; tells the user what changed.
-  Future<void> _checkAwaiting() async {
-    final api = TpmApi(widget.session.env);
-    try {
-      final note = PendingMoveStore.summary(await PendingMoveStore.checkAll(api, widget.session));
-      if (note != null && mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(note)));
-    } on TpmApiException {
-      // Offline or IMS unavailable — the Awaiting IMS page can retry.
-    } finally {
-      api.close();
-    }
-    final n = (await PendingMoveStore.load()).length;
-    if (mounted) setState(() => _awaiting = n);
-  }
-
-  Future<void> _openCount() async {
-    // Start in the Scan Pull destination's warehouse when there is one.
-    final cache = LookupCache();
-    await cache.load();
-    if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => CountListPage(session: widget.session, preferredWarehouseId: cache.destination?.warehouseId),
-      ),
-    );
-  }
-
-  Future<void> _openHistory() async {
-    // The Scan Pull destination (saved by the Scan Pull screen) decides the warehouse.
-    final cache = LookupCache();
-    await cache.load();
-    if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => HistoryPage(
-          session: widget.session,
-          warehouseId: cache.destination?.warehouseId,
-          warehouseName: cache.destination?.warehouseName,
-        ),
-      ),
-    );
-  }
-
-  Future<void> _openAwaiting() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => PendingMovesPage(session: widget.session, onReAdd: ScanStore.appendSaved),
-      ),
-    );
-    _refresh();
-  }
-
-  /// Signing out from any screen returns here first, then to sign-in.
-  Future<void> _signedOut() async {
-    if (!mounted) return;
-    Navigator.of(context).popUntil((r) => r.isFirst);
-    await widget.onSignedOut();
-  }
-
-  Future<void> _openScanPull() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ScanListPage(session: widget.session, onSignedOut: _signedOut),
-      ),
-    );
-    _refresh();
-  }
-
-  Future<void> _signOut() async {
-    final version = await Updater.currentVersion();
-    Updater.check(force: true);
-    if (!mounted) return;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: _accountTitle(widget.session),
-        content: Text(
-          '${widget.session.companyLabel}\nApp version $version'
-          '${_pending == 0 ? '' : '\n\nSigning out clears the $_pending unsubmitted Scan Pull barcode(s) on this device.'}'
-          '${_awaiting == 0 ? '' : '\n\n$_awaiting submitted pull(s) still awaiting IMS confirmation will no longer be tracked here — check them in IMS.'}',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Close')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Sign out')),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    // The next person on this device must not submit this user's list under their own name.
-    await ScanStore.deleteSaved();
-    await LookupCache.clear();
-    await PendingMoveStore.clear();
-    final api = TpmApi(widget.session.env);
-    await api.signOut(widget.session);
-    api.close();
-    await widget.onSignedOut();
-  }
-
-  Widget _task(IconData icon, String title, String subtitle, {VoidCallback? onTap, String? badge}) {
-    final enabled = onTap != null;
-    return Card(
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        // Match the card's rounded corners (list tiles are white by theme).
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        enabled: enabled,
-        leading: Icon(icon, size: 40),
-        title: Text(
-          title,
-          style: const TextStyle(fontFamily: headingFont, fontSize: 22, fontWeight: FontWeight.w600),
-        ),
-        subtitle: Text(subtitle),
-        trailing: badge != null
-            ? Badge(label: Text(badge), largeSize: 24, textStyle: const TextStyle(fontSize: 14))
-            : enabled
-            ? const Icon(Icons.chevron_right)
-            : null,
-        onTap: onTap,
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        leading: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Image.asset('assets/brijj_mark.png', fit: BoxFit.contain),
-        ),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Brijj Inventory'),
-            Text(
-              '${widget.session.fullName} · ${widget.session.companyName}',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Account / sign out',
-            icon: UserAvatar(name: widget.session.fullName),
-            onPressed: _signOut,
-          ),
-        ],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        children: [
-          const UpdateCard(),
-          _task(
-            Icons.remove_shopping_cart,
-            'Scan Pull',
-            'Pull items from the sales floor',
-            onTap: _openScanPull,
-            badge: _pending > 0 ? '$_pending' : null,
-          ),
-          if (_awaiting > 0)
-            _task(
-              Icons.hourglass_top,
-              'Awaiting IMS',
-              '$_awaiting submitted pull(s) not yet confirmed',
-              onTap: _openAwaiting,
-              badge: '$_awaiting',
-            ),
-          _task(Icons.history, 'History', 'Movement orders and pulls from this device', onTap: _openHistory),
-          _task(Icons.swap_horiz, 'Transfers', 'Coming soon'),
-          _task(Icons.fact_check, 'Inventory Count', 'Count an IMS inventory count by scanning', onTap: _openCount),
-        ],
-      ),
-    );
+    return AppShell(key: ValueKey(session.sessionId), session: session, onSignedOut: _signedOut);
   }
 }
 
@@ -713,10 +499,14 @@ Widget _colorChip(ItemDetails d, LookupCache cache) {
 }
 
 class ScanListPage extends StatefulWidget {
-  const ScanListPage({super.key, required this.session, required this.onSignedOut});
+  const ScanListPage({super.key, required this.session, required this.onSignedOut, this.warehouseId});
 
   final BrijjSession session;
   final Future<void> Function() onSignedOut;
+
+  /// The app's selected warehouse: its Scan Pull location is the destination (TPM
+  /// Scan Pull when it has none). Null = any warehouse (older behaviour).
+  final int? warehouseId;
 
   @override
   State<ScanListPage> createState() => _ScanListPageState();
@@ -1455,6 +1245,12 @@ class _ScanListPageState extends State<ScanListPage> {
   /// Whether the company's Scan Pull locations have been loaded at least once.
   bool _locationsKnown = false;
 
+  /// The selected warehouse's Scan Pull locations.
+  List<ScanPullLocation> get _whLocations => [
+    for (final l in _cache.locations)
+      if (widget.warehouseId == null || l.warehouseId == widget.warehouseId) l,
+  ];
+
   /// Chooses the destination: an IMS Scan Pull location when the company has one
   /// (the primary method), otherwise TPM Scan Pull. Keeps the user's pick when it
   /// still exists. Returns true if the destination changed.
@@ -1473,7 +1269,7 @@ class _ScanListPageState extends State<ScanListPage> {
       return false;
     }
     final current = _dest;
-    final locations = _cache.locations;
+    final locations = _whLocations;
     final next = locations.isEmpty
         ? null
         : locations.firstWhere((l) => l.id == current?.id, orElse: () => locations.first);
@@ -1495,7 +1291,7 @@ class _ScanListPageState extends State<ScanListPage> {
   /// Picks between the company's IMS Scan Pull locations (only when there are several).
   Future<void> _chooseDestination() async {
     await _resolveDestination();
-    final locations = _cache.locations;
+    final locations = _whLocations;
     if (!mounted || locations.length < 2) {
       _focus.requestFocus();
       return;
@@ -1542,10 +1338,10 @@ class _ScanListPageState extends State<ScanListPage> {
         subtitle: dest == null
             ? Text(_locationsKnown ? 'No IMS Scan Pull location set up' : 'Checking IMS Scan Pull locations…')
             : const Text('From the sales floor only'),
-        trailing: _cache.locations.length > 1
+        trailing: _whLocations.length > 1
             ? TextButton(onPressed: _submitting ? null : _chooseDestination, child: const Text('Change'))
             : null,
-        onTap: _submitting || _cache.locations.length < 2 ? null : _chooseDestination,
+        onTap: _submitting || _whLocations.length < 2 ? null : _chooseDestination,
       ),
     );
   }
