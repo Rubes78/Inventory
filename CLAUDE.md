@@ -179,6 +179,11 @@ Scan Pull — collect barcodes on the floor, then load them into the system.
 - Builds go to `release/` **and** the self-update feed: after `flutter build apk --release` run
   `./publish.sh "notes for the update card"` (copies to both, writes version.json last, keeps 3 APKs).
 
+## Repo
+
+Git: `git@github.com:Rubes78/Inventory.git` (branch `main`, **public**). Never commit credentials —
+`.env`, keystores, `release/` and APKs are gitignored.
+
 ## Layout
 
 | Path | Contents |
