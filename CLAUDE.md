@@ -179,6 +179,59 @@ Scan Pull — collect barcodes on the floor, then load them into the system.
   it (must have been seen in the last 0.7 s, else "No barcode lined up"). Duplicates still turn the
   box red. App-bar button switches to the old **auto capture**; choice saved in `camera_mode.txt`.
   Awaiting device test.
+- v1.21.0 (2026-10-09, from the dc-dsiemvandroid session — movement-order proposal item 1):
+  **reason + IMS confirmation.** Location-mode submit asks for a reason (chips: Color-week pull
+  (<dominant week color>), Damaged, Tag correction, Other + text) → order `reason` "Scan Pull: …";
+  `specialInstruction` "Brijj Inventory app v<ver>" (+ "batch <yymmdd-hhmmss> part i/n" when >100
+  items split into several orders). Quick orders that come back not Completed (IMS
+  MovementOrderStatus: 1 Open, 2 In progress, 3 Queued, 4 Processing, 5 Completed, 6 Cancelled,
+  7 Failed) are polled 4×3 s after submit (`TpmApi.checkMove` = GET /api/MovementOrders/{id}, line
+  status per serial), then kept in `pending_moves.json` (`lib/pending_moves.dart`) and re-checked
+  every 30 s online + on Home load; "Awaiting IMS" banner/tile → page with refresh, and for
+  cancelled/failed orders "Put back on list" / Dismiss. Cleared on sign-out. Verified checkMove
+  read-only on staging: MO-99-261008-0001 Completed; MO-99-260512-0001 (Week Color "Scan Pull Red",
+  6,676 lines) still Processing since May. The reason picker/submit path is not device-tested.
+- v1.22.0 (2026-10-09, dc-dsiemvandroid session): **History** (Home tile + Scan Pull toolbar),
+  `lib/history.dart`. Tab "Movement orders": IMS orders for the Scan Pull destination's warehouse,
+  newest first, filters Scan Pull only (reason starts "Scan Pull") / Mine (user.id); tap → detail
+  (header + lines: product, sku, from → to, line status, serials; capped at 50 shown per line).
+  **IMS `GET /api/MovementOrders` ignores SortCriteria/SearchTerm and pages oldest-first** —
+  `TpmApi.movementOrders` reads totalCount then fetches pages from the end; the newest page is
+  topped up when short. List items carry `user` {id,name} (creator), completedBy, reason,
+  specialInstruction, totals, warehouse. Tab "This device": `ActivityLog` (`activity_log.json`,
+  last 200 submits, kept across sign-outs, filtered to company + env) — the only in-app record of
+  TPM-mode pulls. Verified list/detail against staging (user's v1.21 pull MO-99-261009-0001,
+  "Scan Pull: Color-week pull (Red)", 3 lines). Tests: `test/history_test.dart`.
+- v1.23.0 (2026-10-09, dc-dsiemvandroid session): **Inventory Count (mobile counting of IMS
+  counts — nothing new server-side).** Counts are still created/approved in the IMS portal; the app
+  does the counting step of the IMS web work item (`462.js` add-review-count), mirrored exactly:
+  list = `GET /api/Worklists?CompanyId&WarehouseId&Type=5` (WarehouseId required; open = statusName
+  not Completed/Cancelled; task line type 11 Physical Item Count / 12 Recount, `referenceId` = count
+  id; IMS sends userName "NotAssigned"). Start = `POST /api/WorklistItems/{task}/ChangeAssignment
+  {userId}`, PUT worklist (line status 3, userId) if worklist not In progress, `PUT
+  /api/InventoryCounts/{id}/Status {2}`. Lines = per count item, `GET /api/Products/{id}?WarehouseId`
+  inventories with onHand>0 (scope 2/3 filtered to scopeItems, recount to its location) — same as
+  web `loadLocationsForCurrentItem`. Scanning routes each barcode to the line expecting it; unexpected
+  ones are looked up (ProductSerials) and counted on their product's line, else rejected "not part of
+  this count". Non-serialized (track ≠ 3) lines get +/−. Submit = `PUT /api/InventoryCounts/{id}`
+  (header echoed, status 2, assignedTo = user if empty, items with inventoryCountingScopeId) with
+  each line {id, inventoryCountingId, productId, warehouseLocationId, expectedCount, actualCount,
+  status 2 Counted, countedById, reviewedBy, InventoryCountingItemSerials: diff only — extras InStock 1,
+  missing Discard 2}, then PUT worklist line status 4 Completed. Approval stays in IMS Counting
+  Approval. Enums: count status 1 Open 2 In progress 3 Complete 4 Canceled; scope 1 products 2
+  locations 3 zones 4 warehouse; item status 1 Pending 2 Counted 3 Approved … 8 Rejected.
+  Progress saved per count (`count_progress_<id>.json`). Files: `lib/count_model.dart` (pure, tested
+  in `test/count_model_test.dart`), `lib/inventory_count.dart`. Loading verified read-only on
+  staging (IC-99-260629-0007 → Pants @ Sales Floor, 1 expected); **start/submit not yet run** —
+  needs a fresh count created in the portal (existing staging counts are other people's tests).
+- v1.23.1 (2026-10-09): user rule — **counts cover the sales floor and storage only, never Scan
+  Pull.** `TpmApi.countableLocations`: active (Lite-listed) locations whose location/profile name has
+  "sales floor", or profile locationTypeId 18 Storage / "storage" in a name, and whose profile (fetched
+  by id) isn't isScanPull. Staging: Memphis Sales Floor 856; Processing Sales Floor 1593, Storage 1624,
+  Storage 2 1625. `buildCountLines(allowedLocations:)` drops other locations (inactive "Scrap",
+  "Producer Bin", old "Scan Pull Memphis" are never listed so never counted); scans of items IMS has
+  elsewhere say "not counted — IMS has it in <loc>". Verified read-only: IC-99-260629-0006 (only in
+  Scrap) → 0 lines; IC-99-260629-0007 → Pants @ Sales Floor.
 - Open: smaller per-ABI APK once the terminal
   model is known.
 - Builds go to `release/` **and** the self-update feed: after `flutter build apk --release` run
@@ -195,6 +248,10 @@ Git: `git@github.com:Rubes78/Inventory.git` (branch `main`, **public**). Never c
 |---|---|
 | `release/ScanPull.apk` | Latest sideloadable build — copy the new APK here after every build |
 | `app/` | Flutter project (`com.brijjworks.scan_pull`, Android only) |
+| `app/lib/count_model.dart` | Inventory Count lines/scans/payload, mirroring the IMS web counting screen |
+| `app/lib/inventory_count.dart` | Inventory Count screens: open count work items, scan-to-count, submit |
+| `app/lib/history.dart` | History: IMS movement orders (list/detail) + this device's submit log |
+| `app/lib/pending_moves.dart` | Submitted IMS moves awaiting confirmation: store, checks, Awaiting IMS page |
 | `app/lib/tpm_api.dart` | `BrijjEnv` (staging/production hosts), Brijj sign-in/refresh/sign-out, Scan Pull permission check, PUT barcodes |
 | `app/lib/lookup.dart` | Per-barcode TPM/IMS state and the skip rules (sales floor only, already pulled…) |
 | `app/lib/main.dart` | Whole app: `ScanStore` (list + file + CSV), `ScanListPage`, `CameraScanPage` |

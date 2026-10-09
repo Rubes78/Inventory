@@ -27,9 +27,10 @@ void main() {
     expect(find.text('Scan Pull'), findsOneWidget);
     expect(find.text('Transfers'), findsOneWidget);
     expect(find.text('Inventory Count'), findsOneWidget);
-    expect(find.text('Coming soon'), findsNWidgets(2));
+    expect(find.text('Coming soon'), findsOneWidget);
 
     final tiles = tester.widgetList<ListTile>(find.byType(ListTile)).toList();
-    expect(tiles.where((t) => t.enabled).length, 1, reason: 'only Scan Pull is enabled');
+    expect(find.text('History'), findsOneWidget);
+    expect(tiles.where((t) => t.enabled).length, 3, reason: 'Scan Pull, History and Inventory Count are enabled; Transfers is a placeholder');
   });
 }

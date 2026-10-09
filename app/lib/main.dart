@@ -10,7 +10,10 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'brand.dart';
+import 'history.dart';
+import 'inventory_count.dart';
 import 'lookup.dart';
+import 'pending_moves.dart';
 import 'tpm_api.dart';
 import 'updater.dart';
 import 'user_photo.dart';
@@ -163,6 +166,9 @@ class _HomePageState extends State<HomePage> {
   /// Unsubmitted Scan Pull barcodes saved on the device.
   int _pending = 0;
 
+  /// Submitted pulls IMS hasn't confirmed yet.
+  int _awaiting = 0;
+
   @override
   void initState() {
     super.initState();
@@ -171,7 +177,66 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _refresh() async {
     final n = await ScanStore.savedCount();
-    if (mounted) setState(() => _pending = n);
+    final waiting = await PendingMoveStore.load();
+    if (mounted) {
+      setState(() {
+        _pending = n;
+        _awaiting = waiting.length;
+      });
+    }
+    if (waiting.isNotEmpty) _checkAwaiting();
+  }
+
+  /// Quietly asks IMS about pulls it hadn't finished; tells the user what changed.
+  Future<void> _checkAwaiting() async {
+    final api = TpmApi(widget.session.env);
+    try {
+      final note = PendingMoveStore.summary(await PendingMoveStore.checkAll(api, widget.session));
+      if (note != null && mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(note)));
+    } on TpmApiException {
+      // Offline or IMS unavailable — the Awaiting IMS page can retry.
+    } finally {
+      api.close();
+    }
+    final n = (await PendingMoveStore.load()).length;
+    if (mounted) setState(() => _awaiting = n);
+  }
+
+  Future<void> _openCount() async {
+    // Start in the Scan Pull destination's warehouse when there is one.
+    final cache = LookupCache();
+    await cache.load();
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => CountListPage(session: widget.session, preferredWarehouseId: cache.destination?.warehouseId),
+      ),
+    );
+  }
+
+  Future<void> _openHistory() async {
+    // The Scan Pull destination (saved by the Scan Pull screen) decides the warehouse.
+    final cache = LookupCache();
+    await cache.load();
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => HistoryPage(
+          session: widget.session,
+          warehouseId: cache.destination?.warehouseId,
+          warehouseName: cache.destination?.warehouseName,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openAwaiting() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => PendingMovesPage(session: widget.session, onReAdd: ScanStore.appendSaved),
+      ),
+    );
+    _refresh();
   }
 
   /// Signing out from any screen returns here first, then to sign-in.
@@ -200,7 +265,8 @@ class _HomePageState extends State<HomePage> {
         title: _accountTitle(widget.session),
         content: Text(
           '${widget.session.companyLabel}\nApp version $version'
-          '${_pending == 0 ? '' : '\n\nSigning out clears the $_pending unsubmitted Scan Pull barcode(s) on this device.'}',
+          '${_pending == 0 ? '' : '\n\nSigning out clears the $_pending unsubmitted Scan Pull barcode(s) on this device.'}'
+          '${_awaiting == 0 ? '' : '\n\n$_awaiting submitted pull(s) still awaiting IMS confirmation will no longer be tracked here — check them in IMS.'}',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Close')),
@@ -212,6 +278,7 @@ class _HomePageState extends State<HomePage> {
     // The next person on this device must not submit this user's list under their own name.
     await ScanStore.deleteSaved();
     await LookupCache.clear();
+    await PendingMoveStore.clear();
     final api = TpmApi(widget.session.env);
     await api.signOut(widget.session);
     api.close();
@@ -280,8 +347,17 @@ class _HomePageState extends State<HomePage> {
             onTap: _openScanPull,
             badge: _pending > 0 ? '$_pending' : null,
           ),
+          if (_awaiting > 0)
+            _task(
+              Icons.hourglass_top,
+              'Awaiting IMS',
+              '$_awaiting submitted pull(s) not yet confirmed',
+              onTap: _openAwaiting,
+              badge: '$_awaiting',
+            ),
+          _task(Icons.history, 'History', 'Movement orders and pulls from this device', onTap: _openHistory),
           _task(Icons.swap_horiz, 'Transfers', 'Coming soon'),
-          _task(Icons.fact_check, 'Inventory Count', 'Coming soon'),
+          _task(Icons.fact_check, 'Inventory Count', 'Count an IMS inventory count by scanning', onTap: _openCount),
         ],
       ),
     );
@@ -466,6 +542,15 @@ class ScanStore {
     } catch (_) {
       return 0;
     }
+  }
+
+  /// Adds barcodes to the saved list without opening the Scan Pull screen.
+  static Future<void> appendSaved(List<String> barcodes) async {
+    final f = await _savedFile();
+    final have = await f.exists() ? (await f.readAsLines()).where((l) => l.isNotEmpty).toList() : <String>[];
+    final add = barcodes.where((b) => !have.contains(b)).toList();
+    if (add.isEmpty) return;
+    await f.writeAsString([...have, ...add].map((b) => '$b\n').join());
   }
 
   static Future<void> deleteSaved() async {
@@ -831,9 +916,13 @@ class _ScanListPageState extends State<ScanListPage> {
     _retry = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!_online) {
         _probe();
-      } else if (_waitingCount > 0) {
-        _catchUp();
+      } else {
+        if (_waitingCount > 0) _catchUp();
+        if (_awaiting > 0) _checkAwaiting();
       }
+    });
+    PendingMoveStore.load().then((m) {
+      if (mounted) setState(() => _awaiting = m.length);
     });
     Future.wait([
       _store.load(),
@@ -1017,6 +1106,123 @@ class _ScanListPageState extends State<ScanListPage> {
     _focus.requestFocus();
   }
 
+  /// Submitted pulls IMS hasn't confirmed yet (see [PendingMoveStore]).
+  int _awaiting = 0;
+  bool _checkingAwaiting = false;
+
+  Future<void> _checkAwaiting() async {
+    if (_checkingAwaiting || !_online) return;
+    _checkingAwaiting = true;
+    final api = TpmApi(widget.session.env);
+    try {
+      final note = PendingMoveStore.summary(await PendingMoveStore.checkAll(api, widget.session));
+      if (note != null && mounted) _snack(note);
+    } on TpmApiException {
+      // Next tick.
+    } finally {
+      api.close();
+      _checkingAwaiting = false;
+    }
+    final n = (await PendingMoveStore.load()).length;
+    if (mounted) setState(() => _awaiting = n);
+  }
+
+  Future<void> _openAwaiting() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => PendingMovesPage(
+          session: widget.session,
+          onReAdd: (barcodes) async {
+            for (final b in barcodes) {
+              if (!_store.barcodes.contains(b)) _add(b);
+            }
+          },
+        ),
+      ),
+    );
+    final n = (await PendingMoveStore.load()).length;
+    if (mounted) setState(() => _awaiting = n);
+    _focus.requestFocus();
+  }
+
+  Future<void> _openHistory() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => HistoryPage(
+          session: widget.session,
+          warehouseId: _dest?.warehouseId,
+          warehouseName: _dest?.warehouseName,
+        ),
+      ),
+    );
+    _focus.requestFocus();
+  }
+
+  Widget _awaitingBar() => Material(
+    color: statusWarningTint,
+    child: ListTile(
+      dense: true,
+      leading: const Icon(Icons.hourglass_top, color: statusWarning),
+      title: Text(
+        '$_awaiting submitted pull(s) awaiting IMS confirmation',
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: _openAwaiting,
+    ),
+  );
+
+  /// The reason last chosen on this device session, offered first next time.
+  static String _lastReasonKind = 'color';
+
+  /// Most common week color among [barcodes], e.g. "Green", for the color-week reason.
+  String? _dominantColor(List<String> barcodes) {
+    final counts = <String, int>{};
+    for (final b in barcodes) {
+      final d = _lookups[b]?.details;
+      if (d == null) continue;
+      final name = d.colorName ?? _cache.colors[d.productionCycleId];
+      if (name != null) counts[name] = (counts[name] ?? 0) + 1;
+    }
+    if (counts.isEmpty) return null;
+    return (counts.entries.toList()..sort((a, b) => b.value.compareTo(a.value))).first.key;
+  }
+
+  /// After a submit, gives IMS a few seconds to finish queued orders so most pulls
+  /// come back confirmed. Returns the orders still unfinished, and updates [results].
+  Future<List<PendingMove>> _confirmMoves(TpmApi api, List<PendingMove> pending, List<ScanPullResult> results) async {
+    var open = List<PendingMove>.of(pending);
+    for (var attempt = 0; attempt < 4 && open.isNotEmpty; attempt++) {
+      await Future<void>.delayed(const Duration(seconds: 3));
+      final still = <PendingMove>[];
+      for (final m in open) {
+        try {
+          final check = await api.checkMove(widget.session, m.orderId);
+          m.status = check.status;
+        } on TpmApiException {
+          still.add(m);
+          continue;
+        }
+        if (!MoveStatus.isFinal(m.status)) {
+          still.add(m);
+          continue;
+        }
+        final failed = m.status != MoveStatus.completed;
+        for (var k = 0; k < results.length; k++) {
+          if (m.barcodes.contains(results[k].barcode)) {
+            results[k] = ScanPullResult(
+              results[k].barcode,
+              failed ? 'Movement ${MoveStatus.label(m.status).toLowerCase()} (${m.ref})' : null,
+              note: m.ref,
+            );
+          }
+        }
+      }
+      open = still;
+    }
+    return open;
+  }
+
   /// Sends the pullable barcodes to the destination — TPM Scan Pull, or an IMS quick
   /// movement into a Scan Pull location — then shows the results. Flagged barcodes
   /// are skipped. Pulled barcodes leave the list; failed and skipped ones stay.
@@ -1037,28 +1243,84 @@ class _ScanListPageState extends State<ScanListPage> {
       return;
     }
     final total = barcodes.fold<double>(0, (t, b) => t + (_lookups[b]?.details?.price ?? 0));
-    final ok = await showDialog<bool>(
+    final color = _dominantColor(barcodes);
+    final reasons = <String, String>{
+      'color': color == null ? 'Color-week pull' : 'Color-week pull ($color)',
+      'damaged': 'Damaged',
+      'tag': 'Tag correction',
+      'other': 'Other',
+    };
+    var kind = _lastReasonKind;
+    final otherText = TextEditingController();
+    // IMS orders carry a reason; TPM Scan Pull has nowhere to put one.
+    final reason = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text(widget.session.env == BrijjEnv.production ? 'Submit Scan Pull — PRODUCTION?' : 'Submit Scan Pull?'),
-        content: Text(
-          '${barcodes.length} item(s), ${_money(total)}, will be '
-          '${dest == null ? 'scan pulled in TPM' : 'moved to ${dest.label}'} — removed from TPM and POS for '
-          '${widget.session.companyLabel}, recorded as ${widget.session.fullName}.'
-          '${skipped.isEmpty ? '' : '\n\n${skipped.length} flagged item(s) will be skipped.'}'
-          '\n\nThis cannot be undone.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: statusDanger),
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Submit'),
-          ),
-        ],
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialog) {
+          final ready = kind != 'other' || otherText.text.trim().isNotEmpty;
+          return AlertDialog(
+            title: Text(widget.session.env == BrijjEnv.production ? 'Submit Scan Pull — PRODUCTION?' : 'Submit Scan Pull?'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${barcodes.length} item(s), ${_money(total)}, will be '
+                    '${dest == null ? 'scan pulled in TPM' : 'moved to ${dest.label}'} — removed from TPM and POS for '
+                    '${widget.session.companyLabel}, recorded as ${widget.session.fullName}.'
+                    '${skipped.isEmpty ? '' : '\n\n${skipped.length} flagged item(s) will be skipped.'}'
+                    '\n\nThis cannot be undone.',
+                  ),
+                  if (dest != null) ...[
+                    const SizedBox(height: 16),
+                    const Text('Reason', style: TextStyle(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 4,
+                      children: [
+                        for (final e in reasons.entries)
+                          ChoiceChip(
+                            label: Text(e.value),
+                            selected: kind == e.key,
+                            onSelected: (_) => setDialog(() => kind = e.key),
+                          ),
+                      ],
+                    ),
+                    if (kind == 'other')
+                      TextField(
+                        controller: otherText,
+                        autofocus: true,
+                        decoration: const InputDecoration(labelText: 'Describe the reason'),
+                        onChanged: (_) => setDialog(() {}),
+                      ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+              FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: statusDanger),
+                onPressed: !ready
+                    ? null
+                    : () => Navigator.pop(
+                        context,
+                        dest == null
+                            ? ''
+                            : 'Scan Pull: ${kind == 'other' ? otherText.text.trim() : reasons[kind]}',
+                      ),
+                child: const Text('Submit'),
+              ),
+            ],
+          );
+        },
       ),
     );
-    if (ok != true || !mounted) return;
+    otherText.dispose();
+    if (reason == null || !mounted) return;
+    _lastReasonKind = kind;
 
     setState(() => _submitting = true);
     final api = TpmApi(widget.session.env);
@@ -1084,12 +1346,53 @@ class _ScanListPageState extends State<ScanListPage> {
             skipped[b] = reason ?? 'Not in IMS inventory';
           }
         }
-        sent = sources.isEmpty ? [] : await api.moveToLocation(widget.session, dest, sources);
+        if (sources.isEmpty) {
+          sent = [];
+        } else {
+          final version = await Updater.currentVersion();
+          final outcome = await api.moveToLocation(
+            widget.session,
+            dest,
+            sources,
+            reason: reason,
+            instruction: 'Brijj Inventory app v$version',
+          );
+          sent = List.of(outcome.results);
+          // Don't take "Queued" as done: confirm now, and keep checking later if needed.
+          final open = await _confirmMoves(api, outcome.pending, sent);
+          await PendingMoveStore.add(open);
+          _awaiting += open.length;
+        }
       }
       final results = [...sent, for (final e in skipped.entries) ScanPullResult(e.key, 'Skipped — ${e.value}')];
       await SessionStore.save(widget.session); // the access token may have been refreshed
       if (!mounted) return;
       final details = {for (final r in results) r.barcode: _lookups[r.barcode]?.details};
+      // Keep a record on the device (the only in-app record of TPM Scan Pulls).
+      await ActivityLog.add(
+        ActivityEntry(
+          at: DateTime.now(),
+          user: widget.session.fullName,
+          company: widget.session.companyName,
+          env: widget.session.env.label,
+          destination: dest?.label ?? 'TPM Scan Pull',
+          reason: reason,
+          items: [
+            for (final r in results)
+              ActivityItem(
+                barcode: r.barcode,
+                error: r.error,
+                note: r.note,
+                description: [
+                  details[r.barcode]?.department,
+                  details[r.barcode]?.category,
+                ].whereType<String>().where((x) => x.isNotEmpty).join(' › '),
+                price: details[r.barcode]?.price ?? 0,
+              ),
+          ],
+        ),
+      );
+      if (!mounted) return;
       setState(() {
         final pulled = results.where((r) => r.pulled).map((r) => r.barcode);
         _store.removeAll(pulled);
@@ -1363,6 +1666,7 @@ class _ScanListPageState extends State<ScanListPage> {
     _store.clear();
     _lookups.clear();
     await LookupCache.clear();
+    await PendingMoveStore.clear();
     final api = TpmApi(session.env);
     await api.signOut(session);
     api.close();
@@ -1387,6 +1691,7 @@ class _ScanListPageState extends State<ScanListPage> {
             icon: UserAvatar(name: widget.session.fullName),
             onPressed: _showAccount,
           ),
+          IconButton(tooltip: 'History', icon: const Icon(Icons.history), onPressed: _openHistory),
           IconButton(tooltip: 'Scanner diagnostics', icon: const Icon(Icons.bug_report), onPressed: _showDiagnostics),
           IconButton(tooltip: 'Clear', icon: const Icon(Icons.delete_sweep), onPressed: _confirmClear),
           IconButton(tooltip: 'Share CSV', icon: const Icon(Icons.share), onPressed: _share),
@@ -1440,6 +1745,7 @@ class _ScanListPageState extends State<ScanListPage> {
             ),
           ),
           _destinationBar(),
+          if (_awaiting > 0) _awaitingBar(),
           if (!_online)
             Container(
               width: double.infinity,

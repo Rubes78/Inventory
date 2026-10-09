@@ -255,24 +255,40 @@ class TpmApi {
   }
 
   /// Moves each item into [dest] with an IMS quick movement order (as IMS Quick
-  /// Relocation does), recorded as the signed-in user. Returns one result per barcode.
-  Future<List<ScanPullResult>> moveToLocation(
+  /// Relocation does), recorded as the signed-in user, with [reason] (e.g. "Scan Pull:
+  /// Damaged") and [instruction] in the order's special instruction. Orders that IMS
+  /// hasn't finished yet (queued/processing) come back in [MoveOutcome.pending] so the
+  /// app can confirm them later. More than [_batchSize] items are split into several
+  /// orders that share a batch tag ("part 1/3") in the special instruction.
+  Future<MoveOutcome> moveToLocation(
     BrijjSession session,
     ScanPullLocation dest,
-    Map<String, ImsSerial> items,
-  ) async {
+    Map<String, ImsSerial> items, {
+    required String reason,
+    String? instruction,
+  }) async {
     final results = <ScanPullResult>[];
+    final pending = <PendingMove>[];
     final entries = items.entries.toList();
+    final parts = (entries.length / _batchSize).ceil();
+    final now = DateTime.now();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final tag = '${now.year % 100}${two(now.month)}${two(now.day)}-${two(now.hour)}${two(now.minute)}${two(now.second)}';
     for (var i = 0; i < entries.length; i += _batchSize) {
       await _ensureFresh(session);
       final batch = entries.sublist(i, (i + _batchSize).clamp(0, entries.length));
+      final part = i ~/ _batchSize + 1;
       final body = await _send('POST', Uri.parse('$imsApi/api/MovementOrders/Quick'), {
         'type': 1, // Relocate
         'relocationType': 3, // Product (IMS sends serial-barcode relocations as Product)
         'priority': 3, // High
         'status': 2,
         'movementOrderProcessType': 2, // Quick
-        'reason': 'Scan Pull',
+        'reason': reason,
+        'specialInstruction': [
+          ?instruction,
+          if (parts > 1) 'batch $tag part $part/$parts',
+        ].join(' · '),
         'warehouseId': dest.warehouseId,
         'companyId': int.tryParse(session.companyId) ?? session.companyId,
         'items': [
@@ -292,20 +308,232 @@ class TpmApi {
         ],
       }, session.accessToken);
       final order = body is Map ? body : const {};
-      final ref = order['referenceNumber'] ?? 'movement order';
-      // Movement order status: 3 Queued, 5 Completed, 6 Cancelled, 7 Failed.
+      final ref = '${order['referenceNumber'] ?? 'movement order'}';
       final status = (order['status'] as num?)?.toInt();
-      final error = switch (status) {
-        5 || 3 => null,
-        6 => 'Movement cancelled ($ref)',
-        7 => 'Movement failed ($ref)',
-        _ => null,
-      };
+      final failed = status == MoveStatus.cancelled || status == MoveStatus.failed;
       for (final e in batch) {
-        results.add(ScanPullResult(e.key, error, note: status == 3 ? 'Queued in $ref' : '$ref'));
+        results.add(ScanPullResult(
+          e.key,
+          failed ? 'Movement ${MoveStatus.label(status).toLowerCase()} ($ref)' : null,
+          note: status == MoveStatus.completed || failed ? ref : '${MoveStatus.label(status)} in $ref — awaiting IMS',
+        ));
+      }
+      final id = (order['id'] as num?)?.toInt();
+      if (!failed && status != MoveStatus.completed && id != null) {
+        pending.add(PendingMove(
+          orderId: id,
+          ref: ref,
+          barcodes: [for (final e in batch) e.key],
+          reason: reason,
+          destination: dest.label,
+          submittedAt: DateTime.now(),
+          status: status ?? 0,
+        ));
       }
     }
-    return results;
+    return MoveOutcome(results, pending);
+  }
+
+  /// One page of [warehouseId]'s movement orders, newest first. IMS ignores sort
+  /// parameters and pages oldest-first, so page 1 here is IMS's last page.
+  Future<MovementOrderPage> movementOrders(
+    BrijjSession session,
+    int warehouseId, {
+    int page = 1,
+    int pageSize = 30,
+  }) async {
+    await _ensureFresh(session);
+    Uri uri(int imsPage, int size) => Uri.parse('$imsApi/api/MovementOrders').replace(
+      queryParameters: {
+        'CompanyId': session.companyId,
+        'WarehouseId': '$warehouseId',
+        'PageNumber': '$imsPage',
+        'PageSize': '$size',
+      },
+    );
+    final head = await _send('GET', uri(1, 1), null, session.accessToken);
+    final total = ((head as Map)['totalCount'] as num?)?.toInt() ?? 0;
+    final pages = (total / pageSize).ceil();
+    if (total == 0 || page > pages) return MovementOrderPage(const [], total, pages);
+    final body = await _send('GET', uri(pages - page + 1, pageSize), null, session.accessToken);
+    final orders = [
+      for (final o in (body as Map)['items'] as List? ?? const [])
+        if (o is Map) MovementOrderSummary.fromJson(o.cast<String, dynamic>()),
+    ]..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return MovementOrderPage(orders, total, pages);
+  }
+
+  /// A movement order with its lines (items, serials, from/to locations).
+  Future<MovementOrderDetail> movementOrder(BrijjSession session, int orderId) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi/api/MovementOrders/$orderId'), null, session.accessToken);
+    return MovementOrderDetail.fromJson((body as Map).cast<String, dynamic>());
+  }
+
+  // ── Inventory Count (mirrors the IMS web app's counting work item) ─────────
+
+  /// The company's warehouses, by id, from its locations (for picking where to count).
+  Future<Map<int, String>> warehouses(BrijjSession session) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/WarehouseLocations/Lite').replace(queryParameters: {'CompanyId': session.companyId});
+    final body = await _send('GET', uri, null, session.accessToken);
+    return {
+      for (final l in body as List? ?? const [])
+        if (l is Map && l['warehouse'] is Map)
+          ((l['warehouse'] as Map)['id'] as num).toInt(): '${(l['warehouse'] as Map)['name']}',
+    };
+  }
+
+  /// Locations an inventory count covers: sales floor and storage only, never a
+  /// Scan Pull location. Sales floor = "sales floor" in the location or profile name
+  /// (as for Scan Pull); storage = location type Storage (18) or "storage" in either
+  /// name. Inactive locations aren't listed, so their stock is never counted.
+  Future<Map<int, String>> countableLocations(BrijjSession session) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/WarehouseLocations/Lite').replace(queryParameters: {'CompanyId': session.companyId});
+    final locations = [for (final l in await _send('GET', uri, null, session.accessToken) as List? ?? const []) if (l is Map) l];
+    final profiles = <int, Map>{};
+    final result = <int, String>{};
+    for (final l in locations) {
+      final pid = ((l['warehouseLocationProfile'] as Map?)?['id'] as num?)?.toInt();
+      if (pid == null) continue;
+      // The Lite list misreports profile flags; fetch each profile once.
+      final profile = profiles[pid] ??= await _send(
+        'GET',
+        Uri.parse('$imsApi/api/WarehouseLocationProfiles/$pid'),
+        null,
+        session.accessToken,
+      ) as Map;
+      final text = '${l['name']} ${profile['name']}'.toLowerCase();
+      final salesFloor = text.contains('sales floor');
+      final storage = profile['locationTypeId'] == 18 || text.contains('storage');
+      if ((salesFloor || storage) && profile['isScanPull'] != true) result[(l['id'] as num).toInt()] = '${l['name']}';
+    }
+    return result;
+  }
+
+  /// Inventory Count work items (worklists of type 5) in [warehouseId] that aren't
+  /// finished, newest first. Counts are created in the IMS portal; this lists them.
+  Future<List<Map<String, dynamic>>> countWorkItems(BrijjSession session, int warehouseId) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/Worklists').replace(
+      queryParameters: {
+        'CompanyId': session.companyId,
+        'WarehouseId': '$warehouseId',
+        'Type': '5', // Inventory Count
+        'PageSize': '200',
+      },
+    );
+    final body = await _send('GET', uri, null, session.accessToken);
+    final items = [
+      for (final w in (body as Map)['items'] as List? ?? const [])
+        if (w is Map) w.cast<String, dynamic>(),
+    ];
+    return items.where((w) => !const {'Completed', 'Cancelled'}.contains(w['statusName'])).toList()
+      ..sort((a, b) => '${b['createdAt']}'.compareTo('${a['createdAt']}'));
+  }
+
+  Future<Map<String, dynamic>> worklist(BrijjSession session, int id) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi/api/Worklists/$id'), null, session.accessToken);
+    return (body as Map).cast<String, dynamic>();
+  }
+
+  Future<Map<String, dynamic>> inventoryCount(BrijjSession session, int id) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi/api/InventoryCounts/$id'), null, session.accessToken);
+    return (body as Map).cast<String, dynamic>();
+  }
+
+  /// A product with its inventories in [warehouseId]: locations, on-hand, serials.
+  Future<Map<String, dynamic>> product(BrijjSession session, int productId, int warehouseId) async {
+    await _ensureFresh(session);
+    final uri = Uri.parse('$imsApi/api/Products/$productId').replace(queryParameters: {'WarehouseId': '$warehouseId'});
+    final body = await _send('GET', uri, null, session.accessToken);
+    return (body as Map).cast<String, dynamic>();
+  }
+
+  /// "Start counting", as the IMS web app does it: assign the work item's task to
+  /// the user, mark the work item and the count In progress.
+  Future<void> startCount(BrijjSession session, Map<String, dynamic> worklist, Map<String, dynamic> count) async {
+    await _ensureFresh(session);
+    final userId = int.tryParse(session.userId) ?? session.userId;
+    final lines = (worklist['worklistLineItems'] as List).cast<Map>();
+    final task = lines.firstWhere((l) => l['type'] == 11 || l['type'] == 12, orElse: () => lines.first);
+    await _send('POST', Uri.parse('$imsApi/api/WorklistItems/${task['id']}/ChangeAssignment'), {
+      'userId': userId,
+    }, session.accessToken);
+    if (worklist['status'] != 2) {
+      lines.first['status'] = 3; // worklist item: In progress
+      lines.first['userId'] = userId;
+      await _send('PUT', Uri.parse('$imsApi/api/Worklists/${worklist['id']}'), worklist, session.accessToken);
+    }
+    if (count['status'] != 2) {
+      await _send('PUT', Uri.parse('$imsApi/api/InventoryCounts/${count['id']}/Status'), {
+        'status': 2, // In progress
+      }, session.accessToken);
+    }
+  }
+
+  /// "Submit all counts", as the IMS web app does it: save the counted [items] on
+  /// the count (still In progress — approval happens in the IMS portal), then mark
+  /// the work item Completed by the user.
+  Future<void> submitCount(
+    BrijjSession session,
+    Map<String, dynamic> worklist,
+    Map<String, dynamic> count,
+    List<Map<String, dynamic>> items,
+  ) async {
+    await _ensureFresh(session);
+    final countItems = (count['items'] as List? ?? const []).cast<Map>();
+    await _send('PUT', Uri.parse('$imsApi/api/InventoryCounts/${count['id']}'), {
+      'id': count['id'],
+      'warehouseId': count['warehouseId'],
+      'type': count['type'],
+      'assignedTo': '${count['assignedTo'] ?? ''}'.isEmpty ? session.userId : count['assignedTo'],
+      'status': 2, // In progress
+      'countingDate': count['countingDate'],
+      'companyId': count['companyId'],
+      'name': count['name'],
+      'startDate': count['startDate'],
+      'startTime': count['startTime'],
+      'includeInactiveProducts': count['includeInactiveProducts'],
+      'completedAt': count['completedAt'],
+      'description': count['description'],
+      'scope': count['scope'],
+      'priority': count['priority'],
+      'items': [
+        for (final i in items)
+          {
+            ...i,
+            'inventoryCountingScopeId': countItems.firstWhere(
+              (c) => c['productId'] == i['productId'],
+              orElse: () => const {},
+            )['inventoryCountingScopeId'],
+          },
+      ],
+    }, session.accessToken);
+    final lines = (worklist['worklistLineItems'] as List).cast<Map>();
+    lines.first['status'] = 4; // worklist item: Completed
+    lines.first['userId'] = int.tryParse(session.userId) ?? session.userId;
+    await _send('PUT', Uri.parse('$imsApi/api/Worklists/${worklist['id']}'), worklist, session.accessToken);
+  }
+
+  /// Current state of a movement order the app submitted.
+  Future<MoveCheck> checkMove(BrijjSession session, int orderId) async {
+    await _ensureFresh(session);
+    final body = await _send('GET', Uri.parse('$imsApi/api/MovementOrders/$orderId'), null, session.accessToken);
+    final order = body is Map ? body : const {};
+    final itemStatus = <String, int>{};
+    for (final it in order['items'] as List? ?? const []) {
+      if (it is! Map) continue;
+      for (final sr in it['serials'] as List? ?? const []) {
+        if (sr is Map && sr['serialNumber'] != null) {
+          itemStatus['${sr['serialNumber']}'] = (it['status'] as num?)?.toInt() ?? 0;
+        }
+      }
+    }
+    return MoveCheck((order['status'] as num?)?.toInt() ?? 0, itemStatus);
   }
 
   /// Pulls [barcodes] as the signed-in user; returns one result per barcode, in order.
@@ -545,6 +773,192 @@ class ImsSerial {
     'warehouseLocation': {'name': locationName},
     'warehouseId': warehouseId,
   };
+}
+
+/// IMS movement order statuses (MovementOrderStatus, from the IMS web app).
+abstract final class MoveStatus {
+  static const open = 1, inProgress = 2, queued = 3, processing = 4, completed = 5, cancelled = 6, failed = 7;
+
+  static String label(int? s) => switch (s) {
+    open => 'Open',
+    inProgress => 'In progress',
+    queued => 'Queued',
+    processing => 'Processing',
+    completed => 'Completed',
+    cancelled => 'Cancelled',
+    failed => 'Failed',
+    _ => 'Submitted',
+  };
+
+  static bool isFinal(int s) => s == completed || s == cancelled || s == failed;
+}
+
+/// A page of movement orders, newest first.
+class MovementOrderPage {
+  MovementOrderPage(this.orders, this.total, this.pages);
+
+  final List<MovementOrderSummary> orders;
+  final int total;
+  final int pages;
+}
+
+/// A movement order as listed by IMS.
+class MovementOrderSummary {
+  MovementOrderSummary.fromJson(Map<String, dynamic> j)
+    : id = (j['id'] as num).toInt(),
+      ref = '${j['referenceNumber'] ?? ''}',
+      status = (j['status'] as num?)?.toInt() ?? 0,
+      relocationType = (j['relocationType'] as num?)?.toInt() ?? 0,
+      reason = '${j['reason'] ?? ''}'.trim(),
+      instruction = '${j['specialInstruction'] ?? ''}'.trim(),
+      products = (j['totalProductCount'] as num?)?.toInt() ?? 0,
+      totalPrice = (j['totalPrice'] as num?)?.toDouble() ?? 0,
+      createdAt = (DateTime.tryParse('${j['createdAt']}') ?? DateTime(2000)).toLocal(),
+      completedAt = DateTime.tryParse('${j['completedAt']}')?.toLocal(),
+      createdBy = '${(j['user'] as Map?)?['name'] ?? ''}',
+      createdById = '${(j['user'] as Map?)?['id'] ?? ''}',
+      completedBy = j['completedBy'] == null ? null : '${j['completedBy']}',
+      warehouse = '${(j['warehouse'] as Map?)?['name'] ?? ''}';
+
+  final int id;
+  final String ref;
+  final int status;
+
+  /// 1 Week color, 2 License plate, 3 Product, 4 Location, 5 Serial barcode.
+  final int relocationType;
+  final String reason;
+  final String instruction;
+  final int products;
+  final double totalPrice;
+  final DateTime createdAt;
+  final DateTime? completedAt;
+  final String createdBy;
+  final String createdById;
+  final String? completedBy;
+  final String warehouse;
+
+  /// Submitted as a scan pull (by this app, or by hand with a "Scan Pull…" reason).
+  bool get isScanPull => reason.toLowerCase().startsWith('scan pull');
+
+  String get relocationLabel => switch (relocationType) {
+    1 => 'Week color',
+    2 => 'License plate',
+    3 => 'Product',
+    4 => 'Location',
+    5 => 'Serial barcode',
+    _ => 'Movement',
+  };
+}
+
+/// One line of a movement order.
+class MovementOrderLine {
+  MovementOrderLine.fromJson(Map<String, dynamic> j)
+    : status = (j['status'] as num?)?.toInt() ?? 0,
+      quantity = (j['quantity'] as num?)?.toInt() ?? 0,
+      product = '${(j['product'] as Map?)?['name'] ?? ''}',
+      sku = '${(j['product'] as Map?)?['sku'] ?? ''}',
+      from = '${(j['sourceLocation'] as Map?)?['name'] ?? j['sourceWarehouseLocationId'] ?? ''}',
+      to = '${(j['destinationLocation'] as Map?)?['name'] ?? j['destinationWarehouseLocationId'] ?? ''}',
+      serials = [
+        for (final s in j['serials'] as List? ?? const [])
+          if (s is Map && s['serialNumber'] != null) '${s['serialNumber']}',
+      ];
+
+  /// MovementOrderItemStatus: 1 Pending, 2 In progress, 3 Completed, 4 Cancelled.
+  final int status;
+  final int quantity;
+  final String product;
+  final String sku;
+  final String from;
+  final String to;
+  final List<String> serials;
+
+  String get statusLabel => switch (status) {
+    1 => 'Pending',
+    2 => 'In progress',
+    3 => 'Completed',
+    4 => 'Cancelled',
+    _ => '—',
+  };
+}
+
+class MovementOrderDetail {
+  MovementOrderDetail.fromJson(Map<String, dynamic> j)
+    : summary = MovementOrderSummary.fromJson(j),
+      lines = [
+        for (final it in j['items'] as List? ?? const [])
+          if (it is Map) MovementOrderLine.fromJson(it.cast<String, dynamic>()),
+      ];
+
+  final MovementOrderSummary summary;
+  final List<MovementOrderLine> lines;
+}
+
+/// What a scan pull to an IMS location produced: one result per barcode, plus the
+/// orders IMS hadn't finished when it answered.
+class MoveOutcome {
+  MoveOutcome(this.results, this.pending);
+
+  final List<ScanPullResult> results;
+  final List<PendingMove> pending;
+}
+
+/// A movement order's status and, per scanned barcode, its line status
+/// (MovementOrderItemStatus: 1 Pending, 2 In progress, 3 Completed, 4 Cancelled).
+class MoveCheck {
+  MoveCheck(this.status, this.itemStatus);
+
+  final int status;
+  final Map<String, int> itemStatus;
+
+  /// Barcodes whose line was cancelled, when the order as a whole finished.
+  List<String> get cancelledBarcodes => [
+    for (final e in itemStatus.entries)
+      if (e.value == 4) e.key,
+  ];
+}
+
+/// A submitted movement order still awaiting IMS confirmation. Saved on the device.
+class PendingMove {
+  PendingMove({
+    required this.orderId,
+    required this.ref,
+    required this.barcodes,
+    required this.reason,
+    required this.destination,
+    required this.submittedAt,
+    required this.status,
+  });
+
+  final int orderId;
+  final String ref;
+  final List<String> barcodes;
+  final String reason;
+  final String destination;
+  final DateTime submittedAt;
+
+  /// Last known [MoveStatus].
+  int status;
+
+  Map<String, dynamic> toJson() => {
+    'orderId': orderId,
+    'ref': ref,
+    'barcodes': barcodes,
+    'reason': reason,
+    'destination': destination,
+    'submittedAt': submittedAt.toIso8601String(),
+    'status': status,
+  };
+
+  static PendingMove fromJson(Map<String, dynamic> j) => PendingMove(
+    orderId: (j['orderId'] as num).toInt(),
+    ref: '${j['ref']}',
+    barcodes: [for (final b in j['barcodes'] as List? ?? const []) '$b'],
+    reason: '${j['reason'] ?? ''}',
+    destination: '${j['destination'] ?? ''}',
+    submittedAt: DateTime.tryParse('${j['submittedAt']}') ?? DateTime.now(),
+    status: (j['status'] as num?)?.toInt() ?? 0,
+  );
 }
 
 class ScanPullResult {
